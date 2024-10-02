@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -40,9 +41,15 @@ var atoms = atomNames(map[string]string{
 	"keyw":    "keyword",
 	"\xa9lyr": "lyrics",
 	"\xa9cmt": "comment",
+	"\xa9mvn": "movement",
+	"\xa9mvc": "total_mov",
+	"\xa9mvi": "mov_index",
+	"shwm":    "showMovement",
 	"tmpo":    "tempo",
 	"cpil":    "compilation",
 	"disk":    "disc",
+	"chpl":    "chapter",
+	"catg":    "catg",
 })
 
 var means = map[string]bool{
@@ -53,6 +60,7 @@ var means = map[string]bool{
 
 // Detect PNG image if "implicit" class is used
 var pngHeader = []byte{137, 80, 78, 71, 13, 10, 26, 10}
+var _ Metadata = &metadataMP4{}
 
 type atomNames map[string]string
 
@@ -70,6 +78,7 @@ func (f atomNames) Name(n string) []string {
 type metadataMP4 struct {
 	fileType FileType
 	data     map[string]interface{}
+	duration int
 }
 
 // ReadAtoms reads MP4 metadata atoms from the io.ReadSeeker into a Metadata, returning
@@ -104,6 +113,13 @@ func (m metadataMP4) readAtoms(r io.ReadSeeker) error {
 
 		case "moov", "udta", "ilst":
 			return m.readAtoms(r)
+		case "mvhd":
+			err := m.readMHVDAtom(r, size)
+			if err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		_, ok := atoms[name]
@@ -182,6 +198,9 @@ func (m metadataMP4) readAtomData(r io.ReadSeeker, name string, size uint32, pro
 		m.data[name+"_count"] = int(b[5])
 		return nil
 	}
+	if name == "chpl" {
+		contentType = "chapter"
+	}
 
 	if contentType == "implicit" {
 		if name == "covr" {
@@ -202,7 +221,11 @@ func (m metadataMP4) readAtomData(r io.ReadSeeker, name string, size uint32, pro
 
 	case "text":
 		data = string(b)
-
+	case "chapter":
+		data, err = parseChapters(b)
+		if err != nil {
+			return nil
+		}
 	case "uint8":
 		if len(b) < 1 {
 			return fmt.Errorf("invalid encoding: expected at least %d bytes, for integer tag data, got %d", 1, len(b))
@@ -217,6 +240,89 @@ func (m metadataMP4) readAtomData(r io.ReadSeeker, name string, size uint32, pro
 		}
 	}
 	m.data[name] = data
+
+	return nil
+}
+func (m *metadataMP4) readMHVDAtom(r io.ReadSeeker, atomHeaderSize uint32) error {
+	var b []byte
+	var err error
+
+	seekBytesLeft := int64(atomHeaderSize)
+
+	// +1 byte, version
+	b, err = readBytes(r, 1)
+	if err != nil {
+		return err
+	}
+
+	version := getInt(b[0:1])
+
+	// +3 bytes, jump over flags
+	_, err = r.Seek(3, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	seekBytesLeft -= 4
+
+	var duration float64
+
+	if version == 0 {
+		// version 0 uses 32 bit integers for timestamps
+
+		// +8 bytes, jump over create & mod times
+		_, err = r.Seek(8, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+
+		// +4 bytes
+		timeScale, err := readUint32BigEndian(r)
+		if err != nil {
+			return err
+		}
+
+		// +4 bytes
+		dur, err := readUint32BigEndian(r)
+		if err != nil {
+			return err
+		}
+
+		seekBytesLeft -= 16
+
+		duration = float64(dur) / float64(timeScale)
+
+	} else {
+		// version 1 uses 64 bit integers for timestamps
+
+		// +16 bytes, jump over create & mod times
+		_, err = r.Seek(16, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+
+		// +4 bytes
+		timeScale, err := readUint32BigEndian(r)
+		if err != nil {
+			return err
+		}
+
+		// +8 bytes
+		dur, err := readUint64BigEndian(r)
+		if err != nil {
+			return err
+		}
+
+		seekBytesLeft -= 28
+
+		duration = float64(dur) / float64(timeScale)
+	}
+
+	m.duration = int(duration)
+
+	if _, err = r.Seek(seekBytesLeft-8, io.SeekCurrent); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -376,4 +482,63 @@ func (m metadataMP4) Picture() *Picture {
 	}
 	p, _ := v.(*Picture)
 	return p
+}
+
+func (m *metadataMP4) Duration() int {
+	return m.duration
+}
+
+// Chapter represents a chapter with start time, end time, and title.
+type Chapter struct {
+	id        uint8
+	StartTime int64
+	EndTime   int64
+	Title     string
+}
+
+func parseChapters(data []byte) ([]Chapter, error) {
+	var chapters []Chapter
+
+	separator := []byte{0, 0, 0}
+	sections := bytes.Split(data, separator)
+
+	for index, section := range sections {
+		if len(section) < 6 {
+			continue // Skip sections that are too short to contain valid data
+		}
+
+		var startTimeFloat float64
+		var title string
+
+		if index == 0 {
+			startTimeFloat = 0
+			title = string(section)
+		} else {
+			startTime := binary.BigEndian.Uint32(section[0:4])
+			startTimeFloat = float64(startTime) * 256 / 10000000
+			title = string(section[6:])
+		}
+
+		startTimeSeconds := int64(math.Round(startTimeFloat))
+
+		chapter := Chapter{
+			Title:     title,
+			StartTime: startTimeSeconds,
+			EndTime:   0, // We'll set this later
+		}
+
+		// Set the EndTime of the previous chapter
+		if index > 0 && len(chapters) > 0 {
+			chapters[len(chapters)-1].EndTime = startTimeSeconds
+		}
+
+		chapters = append(chapters, chapter)
+	}
+
+	// Set the EndTime of the last chapter to 0 (or you might want to set it to the total duration if available)
+	if len(chapters) > 0 {
+		chapters[len(chapters)-1].EndTime = 0
+	}
+
+	return chapters, nil
 }
