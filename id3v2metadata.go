@@ -104,6 +104,10 @@ func (m metadataID3v2) Year() int {
 	return date.Year()
 }
 
+func (m metadataID3v2) Duration() int {
+	return 0
+}
+
 func parseXofN(s string) (x, n int) {
 	xn := strings.Split(s, "/")
 	if len(xn) != 2 {
