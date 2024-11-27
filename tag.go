@@ -6,13 +6,14 @@
 // parsing and artwork extraction.
 //
 // Detect and parse tag metadata from an io.ReadSeeker (i.e. an *os.File):
-// 	m, err := tag.ReadFrom(f)
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	log.Print(m.Format()) // The detected format.
-// 	log.Print(m.Title())  // The title of the track (see Metadata interface for more details).
-package tag
+//
+//	m, err := tag.ReadFrom(f)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	log.Print(m.Format()) // The detected format.
+//	log.Print(m.Title())  // The title of the track (see Metadata interface for more details).
+package taggart
 
 import (
 	"errors"
@@ -140,7 +141,7 @@ type Metadata interface {
 
 	// Comment returns the comment, or an empty string if unavailable.
 	Comment() string
-	
+
 	// Duration returns the track duration in seconds.
 	Duration() int
 
